@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""triagem-logs — lê os logs de produção no Dozzle, agrupa os erros e usa o Claude
+para separar problemas reais de código do ruído (timeouts do cliente, erros esperados).
+
+  triagem-logs                 varre os logs desde a última varredura (máx. 6 h) e analisa grupos novos
+  triagem-logs --desde 3h      varre uma janela específica (ex: 30m, 3h, 1d)
+  triagem-logs lista           problemas abertos por gravidade (+ resumo dos demais)
+  triagem-logs ver N           detalhe do problema N (causa, arquivo, exemplo do log, correção)
+  triagem-logs corrigir N      abre o Claude no repositório com o contexto do problema N
+  triagem-logs resolvido N     marca como resolvido (volta ao painel se reaparecer nos logs)
+  triagem-logs ignorar N       ruído conhecido: nunca mais aparece
+  triagem-logs reabrir N       volta o problema para aberto
+  triagem-logs lentos          endpoints mais lentos (P95, do Grafana)
+  triagem-logs painel          mostra a tabela do painel do terminal
+
+Varredura automática: timer do systemd de usuário (triagem-logs.timer, a cada 30 min).
+Config: ~/.config/triagem-logs/config.json (gerado pelo distro-setup) · regras de ruído: ~/.config/triagem-logs/ignorar.txt
+Estado: ~/.local/state/triagem-logs/ (problemas.json, painel.ansi, varredura.log)
+"""
+import fcntl, hashlib, json, os, re, shutil, subprocess, sys, textwrap, time
+import urllib.parse, urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CONF_DIR = Path.home() / ".config/triagem-logs"
+STATE_DIR = Path.home() / ".local/state/triagem-logs"
+STATE = STATE_DIR / "problemas.json"
+PAINEL = STATE_DIR / "painel.ansi"
+IGNORAR = CONF_DIR / "ignorar.txt"
+MODEL = os.environ.get("TRIAGEM_MODEL", "sonnet")
+TIMEOUT = int(os.environ.get("TRIAGEM_TIMEOUT", "600"))
+MAX_ANALISE = 30          # grupos novos por varredura mandados ao Claude (o resto fica para a próxima)
+JANELA_MAX = timedelta(hours=6)
+
+# Sem config.json não há Dozzle/Grafana: a varredura não faz nada e o painel não aparece.
+# O config é gerado pelo assistente de primeira configuração (distro-setup).
+#   "agente": "claude" | "opencode" (quem classifica os erros e abre o "corrigir")
+DEFAULT_CONF = {"dozzle": "", "agente": "claude", "servicos": {}}
+OPENCODE_MODEL = os.environ.get("TRIAGEM_OPENCODE_MODEL", "")  # vazio = modelo padrão do opencode
+DEFAULT_IGNORAR = """# Uma regex por linha (sem diferenciar maiúsculas). Grupos cujo título ou exemplo casarem
+# com alguma regra são descartados antes da análise. Linhas com # são comentários.
+# Exemplos:
+# Nenhum pedido encontrado
+# socket hang up
+"""
+
+BOLA = {"critico": "🔴", "alto": "🟠", "medio": "🟡", "baixo": "🔵", "ruido": "⚪", None: "⚫"}
+GRAV = {  # ordem, rótulo, cor
+    "critico": (0, "CRÍTICO", "255;85;85"),
+    "alto": (1, "ALTO", "255;150;50"),
+    "medio": (2, "MÉDIO", "240;210;80"),
+    "baixo": (3, "BAIXO", "120;170;255"),
+    "ruido": (4, "RUÍDO", "140;140;140"),
+    None: (5, "SEM ANÁLISE", "140;140;140"),
+}
+R, D, B = "\033[0m", "\033[2m", "\033[1m"
+
+
+def c(rgb, t):
+    return f"\033[38;2;{rgb}m{t}{R}"
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"\033[31m✗{R} {msg}\n")
+    sys.exit(code)
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(s):
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)  # Docker manda nanossegundos
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def local_hm(s):
+    return parse_iso(s).astimezone().strftime("%H:%M") if s else "--:--"
+
+
+# ---------------------------------------------------------------- config e estado
+def load_conf():
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    p = CONF_DIR / "config.json"
+    if not IGNORAR.exists():
+        IGNORAR.write_text(DEFAULT_IGNORAR)
+    conf = dict(DEFAULT_CONF)
+    if p.exists():
+        conf.update(json.loads(p.read_text()))
+    return conf
+
+
+def load_state():
+    if STATE.exists():
+        st = json.loads(STATE.read_text())
+        if not st.get("mascarado"):  # estado criado antes da máscara de dados sensíveis
+            for p in st["problemas"].values():
+                for k in ("exemplo", "mensagem"):
+                    if p.get(k):
+                        p[k] = mask(p[k])
+            st["mascarado"] = True
+            save_state(st)
+        return st
+    return {"proximo_id": 1, "ultima_varredura": None, "problemas": {}, "mascarado": True}
+
+
+def save_state(st):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=1, ensure_ascii=False))
+    tmp.replace(STATE)
+
+
+class Lock:
+    def __enter__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.f = open(STATE_DIR / ".lock", "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+# ---------------------------------------------------------------- Dozzle
+def containers(conf):
+    """Lista de containers: lê o 1º evento containers-changed do SSE do Dozzle."""
+    req = urllib.request.Request(conf["dozzle"] + "/api/events/stream", headers={"Accept": "text/event-stream"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        event = None
+        for raw in r:
+            line = raw.decode(errors="replace").rstrip("\n")
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:") and event == "containers-changed":
+                return json.loads(line[5:])
+    return []
+
+
+def fetch_logs(conf, host, cid, desde, ate):
+    body = urllib.parse.urlencode({"container": f"{host}/{cid}", "from": iso(desde), "to": iso(ate)}).encode()
+    req = urllib.request.Request(conf["dozzle"] + "/api/containers/logs?stdout=1&stderr=1", data=body, method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.read().decode(errors="replace")
+
+
+# ---------------------------------------------------------------- Grafana (latência P95)
+def controller_de(repo, rota):
+    """Roteamento por arquivo do rest: /a/b -> src/controllers/a/b/<método>.ts"""
+    base = Path(os.path.expanduser(repo)) / "src/controllers" / rota.strip("/")
+    if base.is_dir():
+        arqs = sorted(x.name for x in base.glob("*.ts"))
+        rel = base.relative_to(Path(os.path.expanduser(repo)))
+        return f"{rel}/{arqs[0]}" if len(arqs) == 1 else f"{rel}/ ({', '.join(a[:-3] for a in arqs)})" if arqs else str(rel)
+    return ""
+
+
+def lentos(conf):
+    g = conf.get("grafana")
+    g = dict(g, prefixo=g.get("prefixo", "")) if g else None
+    if not g:
+        return None
+    body = json.dumps({"intervalMs": 60000, "maxDataPoints": 120,
+                       "timeRange": {"from": g.get("janela", "now-1h"), "to": "now", "timezone": "browser"}}).encode()
+    req = urllib.request.Request(f"{g['url']}/api/public/dashboards/{g['dashboard']}/panels/{g['painel']}/query",
+                                 data=body, method="POST", headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        res = json.load(r)
+    repo = conf.get("servicos", {}).get(g.get("servico", ""), {}).get("repo", "")
+    itens = []
+    for out in res.get("results", {}).values():
+        for f in out.get("frames", []):
+            campos, vals = f["schema"]["fields"], f["data"]["values"]
+            path = next((x.get("labels", {}).get("path") for x in campos if x.get("labels")), None)
+            if not path or not path.startswith(g["prefixo"] + "/"):
+                continue
+            serie = [v for v in (vals[1] if len(vals) > 1 else []) if v is not None]
+            if not serie:
+                continue
+            rota = path[len(g["prefixo"]):]
+            itens.append({"path": path, "atual": round(serie[-1], 2), "pico": round(max(serie), 2),
+                          "controller": controller_de(repo, rota) if repo else ""})
+    itens.sort(key=lambda x: -x["atual"])
+    return itens
+
+
+def seg(v):
+    """Segundos legíveis, com a cor dos limites do dashboard (verde < 1 s, amarelo < 3 s, vermelho)."""
+    t = f"{v:.0f}s" if v >= 10 else f"{v:.1f}s" if v >= 1 else f"{v * 1000:.0f}ms"
+    cor = "120;200;120" if v < 1 else "240;210;80" if v < 3 else "255;85;85"
+    return c(cor, t)
+
+
+# ---------------------------------------------------------------- agrupamento
+TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?\s*")
+CONT = re.compile(r"^(\s|[}\])]|Cause:|Caused by|\^)")
+APP_FRAME = re.compile(r"file:///app/(src/[^\s)\"'\\]+?):(\d+)(?::\d+)?")
+ERR_WORD = re.compile(r"\b(error|exception|uncaught|fatal|panic|failed|failure|falha|erro|ECONN\w+|ETIMEDOUT|EAI_AGAIN|"
+                      r"timeout|timed out|denied|refused|unauthorized|forbidden)\b", re.I)
+HTTP5 = re.compile(r"^\s*5\d\d\s+(GET|POST|PUT|PATCH|DELETE)\b")
+FIELD = re.compile(r'^  (name|message|sqlMessage|code|status): (.+?),?$', re.M)
+
+
+def split_entries(text):
+    entries, cur = [], []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        # Deno: "error: Uncaught ..." vem seguido da linha de código (sem recuo) e do "^"
+        if cur and (CONT.match(line) or (len(cur) == 1 and cur[0].startswith("error: "))):
+            cur.append(line)
+        else:
+            if cur:
+                entries.append(cur)
+            cur = [line]
+    if cur:
+        entries.append(cur)
+    return entries
+
+
+def norm(s):
+    s = TS.sub("", s)
+    s = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#", s, flags=re.I)
+    s = re.sub(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d[:\d.]*\S*", "#", s)
+    s = re.sub(r"\b[0-9a-f]{12,}\b", "#", s, flags=re.I)
+    s = re.sub(r"\d+", "#", s)
+    s = re.sub(r"^(error: )?Uncaught (\(in promise\) )?", "", s.strip(), flags=re.I)
+    return re.sub(r"\s+", " ", s)[:220]
+
+
+SENSIVEL = [  # (regex, substituto): aplicado ANTES de agrupar, guardar ou mandar ao Claude
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 ***"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "<jwt>"),
+    (re.compile(r"""(?i)(["']?(?:password|passwd|senha|pass|pwd|secret|client_secret|token|access_token|refresh_token|api[_-]?key|apikey|authorization|cookie|x-api-key|appkey|apptoken)["']?\s*[:=]\s*)(["'])[^"']*\2"""), r"\1\2***\2"),
+    (re.compile(r"(?i)((?:password|senha|token|api[_-]?key|secret)=)[^&\s\"']+"), r"\1***"),
+    (re.compile(r"(?i)(\"?(?:x-vtex-api-apptoken|x-vtex-api-appkey|authorization)\"?,\s*\n?\s*\")[^\"]+"), r"\1***"),
+    (re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"), "<email>"),
+    (re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b"), "<cpf>"),
+    (re.compile(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b"), "<cnpj>"),
+    (re.compile(r"(?i)(\b(?:cpf|cnpj|document|documento)\"?\s*[:=]\s*\"?)\d{11,14}"), r"\1<doc>"),
+    (re.compile(r"\b(?:\d[ -]?){13,19}\b(?=.*(?i:card|cart[aã]o|pan))"), "<cartao>"),
+    (re.compile(r"\b[A-Za-z0-9+/]{60,}={0,2}"), "<segredo>"),  # blobs longos (chaves, senhas cifradas)
+]
+
+
+def mask(t):
+    for rx, sub in SENSIVEL:
+        t = rx.sub(sub, t)
+    return t
+
+
+def analyze_entry(lines):
+    """Devolve (mensagem, frame, é_erro) de um bloco de log."""
+    head = TS.sub("", lines[0]).strip()
+    body = "\n".join(lines)
+    frame = None
+    m = APP_FRAME.search(body)
+    if m:
+        frame = f"{m.group(1)}:{m.group(2)}"
+    if head.endswith("{"):  # objeto despejado (console.error(err))
+        f = {k: v.strip().strip('"') for k, v in FIELD.findall(body)}
+        if not ({"name", "message", "sqlMessage", "code"} & f.keys()):
+            return None, None, False  # dump sem cara de erro (ex: IncomingMessage)
+        msg = ": ".join(x for x in (f.get("name"), f.get("sqlMessage") or f.get("message")) if x)
+        if f.get("code"):
+            msg += f" [{f['code']}]"
+        if f.get("status"):
+            msg = f"status {f['status']} " + msg
+        return msg, frame, True
+    msg = head
+    cause = next((l.strip() for l in lines if l.startswith(("Cause:", "Caused by"))), None)
+    if HTTP5.match(head):
+        msg = re.sub(r"\s*Request-Id:.*", "", head)
+        sub = next((l.strip() for l in lines[1:] if l.strip() and not l.strip().startswith("at ")), None)
+        if sub:
+            msg += " | " + sub
+        if cause:
+            msg += " | " + cause
+        return msg, frame, True
+    if cause:
+        msg += " | " + cause
+    is_err = bool(ERR_WORD.search(head)) or bool(cause) or (frame is not None and any(l.lstrip().startswith("at ") for l in lines))
+    return msg, frame, is_err
+
+
+def group_logs(servico, cname, text, groups):
+    last = None
+    for lines in split_entries(mask(text)):
+        msg, frame, is_err = analyze_entry(lines)
+        if not is_err or not msg:
+            continue
+        sig = norm(msg) + (f" @ {frame}" if frame else "")
+        dup = sig == last and lines[0].startswith("error: Uncaught")  # Deno repete o erro já impresso
+        last = sig
+        if dup:
+            continue
+        key = hashlib.sha1(f"{servico}|{sig}".encode()).hexdigest()[:12]
+        g = groups.setdefault(key, {"servico": servico, "assinatura": sig, "mensagem": msg[:300], "frame": frame,
+                                    "contagem": 0, "containers": set(), "por_container": {}, "exemplo": None})
+        g["contagem"] += 1
+        g["containers"].add(cname)
+        g["por_container"][cname] = g["por_container"].get(cname, 0) + 1
+        if g["exemplo"] is None:
+            ex = "\n".join(l[:400] for l in lines[:40])
+            g["exemplo"] = ex[:3500]
+
+
+def regras_ignorar():
+    out = []
+    if IGNORAR.exists():
+        for l in IGNORAR.read_text().splitlines():
+            l = l.strip()
+            if l and not l.startswith("#"):
+                try:
+                    out.append(re.compile(l, re.I))
+                except re.error:
+                    sys.stderr.write(f"regra inválida em {IGNORAR}: {l}\n")
+    return out
+
+
+# ---------------------------------------------------------------- análise com o Claude
+SYSTEM = """Você é um engenheiro sênior fazendo triagem de logs de PRODUÇÃO de uma aplicação Deno/TypeScript.
+Você está na raiz do repositório da aplicação. Nos logs, caminhos /app/... correspondem à raiz deste repositório
+(ex: file:///app/src/jobs/x.ts:10 é src/jobs/x.ts linha 10). Use Read/Grep/Glob para abrir o código citado
+e decidir se o erro exige mudança no NOSSO código.
+
+Para cada grupo de erro recebido, classifique:
+- gravidade: "critico" (perda de dados, fluxo principal quebrado, crash, erro em massa de código nosso),
+  "alto" (bug real de código que afeta usuários ou jobs, precisa de correção logo),
+  "medio" (bug real, impacto limitado ou contornado), "baixo" (melhoria: tratamento/log ruim, mensagem confusa),
+  "ruido" (esperado, culpa do cliente/serviço externo sem ação no nosso código, timeout do lado do cliente).
+- origem: "codigo" | "banco" | "externo" | "cliente" | "esperado"
+- titulo: até 60 caracteres, português, específico (ex: "token null quando login no Toledo falha")
+- arquivo: "caminho/no/repo.ts:linha" do ponto a corrigir (ou "" se não houver)
+- causa: 1 a 2 frases objetivas com a causa provável, baseada no código que você leu
+- correcao: 1 a 3 frases com a correção sugerida (ou o que fazer se não for código)
+- ignorar: true se for ruído que pode ser ignorado para sempre
+
+Responda APENAS com um array JSON, um objeto por grupo, com a chave "key" igual à recebida:
+[{"key": "...", "gravidade": "...", "origem": "...", "titulo": "...", "arquivo": "...", "causa": "...", "correcao": "...", "ignorar": false}]"""
+
+
+def extrai_json(out, quem):
+    m = re.search(r"\[\s*\{.*\}\s*\]", out, re.S)
+    if not m:
+        raise RuntimeError(f"resposta do {quem} sem JSON: " + out[:300])
+    return {x["key"]: x for x in json.loads(m.group(0)) if isinstance(x, dict) and "key" in x}
+
+
+def ask_opencode(repo, prompt):
+    # agente "plan" do opencode: só lê o código, não edita
+    cmd = ["opencode", "run", "--agent", "plan"] + (["-m", OPENCODE_MODEL] if OPENCODE_MODEL else [])
+    cmd.append(SYSTEM + "\n\nClassifique os grupos de erro abaixo.\n\n" + prompt)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT, cwd=repo, stdin=subprocess.DEVNULL)
+    if r.returncode:
+        raise RuntimeError("opencode falhou: " + (r.stderr.strip() or r.stdout.strip())[:400])
+    return extrai_json(re.sub(r"\x1b\[[0-9;]*m", "", r.stdout), "opencode")
+
+
+def ask_claude(repo, grupos, agente="claude"):
+    payload = []
+    for key, g in grupos:
+        payload.append(f"### key: {key}\nocorrências na janela: {g['contagem']} · containers: {', '.join(sorted(g['containers']))}\n"
+                       f"assinatura: {g['assinatura']}\nexemplo do log:\n{g['exemplo']}\n")
+    prompt = "Grupos de erro para classificar:\n\n" + "\n".join(payload)
+    if agente == "opencode":
+        return ask_opencode(repo, prompt)
+    cmd = ["claude", "-p", "--model", MODEL, "--tools", "Read,Grep,Glob", "--allowedTools", "Read,Grep,Glob",
+           "--no-session-persistence", "--settings", '{"disableAllHooks": true}', "--system-prompt", SYSTEM,
+           "Classifique os grupos de erro abaixo."]
+    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=TIMEOUT, cwd=repo)
+    if r.returncode:
+        raise RuntimeError("claude falhou: " + (r.stderr.strip() or r.stdout.strip())[:400])
+    return extrai_json(r.stdout, "Claude")
+
+
+# ---------------------------------------------------------------- varredura
+def parse_dur(s):
+    m = re.fullmatch(r"(\d+)\s*([mhd])", s.strip())
+    if not m:
+        die(f"duração inválida: {s} (use 30m, 3h, 1d)")
+    return timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[m.group(2)]: int(m.group(1))})
+
+
+def varrer(desde_arg=None):
+    conf = load_conf()
+    if not conf.get("dozzle"):
+        print("Dozzle não configurado (rode distro-setup para configurar). Nada a fazer.")
+        return
+    with Lock():
+        st = load_state()
+        ate = now()
+        if desde_arg:
+            desde = ate - parse_dur(desde_arg)
+        elif st["ultima_varredura"]:
+            desde = max(parse_iso(st["ultima_varredura"]), ate - JANELA_MAX)
+        else:
+            desde = ate - JANELA_MAX
+        horas = max((ate - desde).total_seconds() / 3600, 1 / 60)
+        log(f"varredura {iso(desde)} → {iso(ate)}")
+
+        todos = containers(conf)
+        groups, inicio = {}, {}
+        for servico, sc in conf["servicos"].items():
+            pat = re.compile(sc["container"])
+            alvo = [x for x in todos if pat.match(x.get("name", "")) and x.get("state") == "running"]
+            if not alvo:
+                log(f"⚠ nenhum container de {servico} encontrado")
+            for x in alvo:
+                inicio[x["name"]] = x.get("startedAt")
+            if alvo:
+                st.setdefault("deploys", {})[servico] = max(x.get("startedAt") or "" for x in alvo)
+            for x in alvo:
+                text = fetch_logs(conf, x["host"], x["id"], desde, ate)
+                group_logs(servico, x["name"], text, groups)
+                log(f"  {x['name']}: {len(text) // 1024} KB")
+
+        regras = regras_ignorar()
+        probs = st["problemas"]
+        stamp = iso(ate)
+        # histórico de varreduras (taxa/h = ocorrências nas últimas 6 h de varreduras / horas cobertas)
+        corte = ate - timedelta(hours=6)
+        st["varreduras"] = [v for v in st.get("varreduras", []) if parse_iso(v[0]) > corte] + [[stamp, horas]]
+        validos = {v[0] for v in st["varreduras"]}
+        horas_cob = sum(v[1] for v in st["varreduras"])
+        novos = {}
+        for key, g in groups.items():
+            if any(r.search(g["assinatura"]) or r.search(g["exemplo"] or "") for r in regras):
+                continue
+            p = probs.get(key)
+            if p is None:
+                p = probs[key] = {"id": st["proximo_id"], "servico": g["servico"], "assinatura": g["assinatura"],
+                                  "mensagem": g["mensagem"], "frame": g["frame"], "exemplo": g["exemplo"],
+                                  "status": "aberto", "gravidade": None, "primeira_vez": stamp, "total": 0}
+                st["proximo_id"] += 1
+            p["total"] += g["contagem"]
+            p.setdefault("hist", {})[stamp] = g["contagem"]
+            p["visto_em"] = stamp
+            p["containers"] = sorted(g["containers"])
+            if p["status"] == "resolvido":
+                # só conta como "voltou" o erro vindo de container iniciado DEPOIS de marcar resolvido (deploy da correção)
+                res = parse_iso(p["resolvido_em"])
+                depois = sum(n for cn, n in g["por_container"].items() if inicio.get(cn) and parse_iso(inicio[cn]) > res)
+                if depois:
+                    p["status"], p["voltou"] = "aberto", stamp
+                    log(f"  ⚠ #{p['id']} voltou depois do deploy: {p.get('titulo') or p['assinatura'][:60]}")
+            if p.get("gravidade") is None:
+                novos[key] = g
+
+        for p in probs.values():
+            p["hist"] = {k: v for k, v in p.get("hist", {}).items() if k in validos}
+            p["taxa"] = round(sum(p["hist"].values()) / horas_cob, 1)
+        # análise: só grupos que o Claude ainda não viu, mais frequentes primeiro
+        fila = sorted(novos.items(), key=lambda kv: -kv[1]["contagem"])[:MAX_ANALISE]
+        if not conf.get("agente"):  # sem agente: os erros entram no painel sem classificação
+            fila = []
+        for servico, sc in conf["servicos"].items():
+            lote = [(k, g) for k, g in fila if g["servico"] == servico]
+            for i in range(0, len(lote), 10):
+                parte = lote[i:i + 10]
+                log(f"  analisando {len(parte)} grupo(s) de {servico} com o {conf['agente']}…")
+                try:
+                    res = ask_claude(os.path.expanduser(sc["repo"]), parte, conf["agente"])
+                except Exception as e:
+                    log(f"  ✗ {e}")
+                    continue
+                for k, _ in parte:
+                    a = res.get(k)
+                    if not a:
+                        continue
+                    p = probs[k]
+                    gv = a.get("gravidade") if a.get("gravidade") in GRAV else "medio"
+                    p.update(gravidade=gv, origem=a.get("origem", ""), titulo=(a.get("titulo") or "")[:70],
+                             arquivo=a.get("arquivo", ""), causa=a.get("causa", ""), correcao=a.get("correcao", ""),
+                             analisado_em=stamp)
+                    if gv == "ruido" and a.get("ignorar") and p["status"] == "aberto":
+                        p["status"] = "ruido"
+                    st["problemas"][k] = p
+                save_state(st)
+
+        try:
+            itens = lentos(conf)
+            if itens is not None:
+                st["lentos"] = {"atualizado": stamp, "itens": itens}
+                log(f"  grafana: {len(itens)} endpoint(s) no P95")
+        except Exception as e:
+            log(f"  ✗ grafana: {e}")
+
+        st["ultima_varredura"] = stamp
+        save_state(st)
+        escrever_painel(st)
+        abertos = [p for p in probs.values() if p["status"] == "aberto"]
+        log(f"fim: {len(groups)} grupo(s) na janela, {len(abertos)} problema(s) aberto(s)")
+
+
+def log(msg):
+    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    print(msg, file=sys.stderr if sys.stdout.isatty() else sys.stdout)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        lp = STATE_DIR / "varredura.log"
+        if lp.exists() and lp.stat().st_size > 2_000_000:
+            lp.replace(lp.with_suffix(".log.1"))
+        with open(lp, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- consulta
+def ordem(p):
+    novo = p.get("voltou") or (p.get("primeira_vez") and now() - parse_iso(p["primeira_vez"]) < timedelta(hours=24))
+    return (GRAV[p.get("gravidade")][0], 0 if novo else 1, -(p.get("taxa") or 0), -p.get("total", 0))
+
+
+def abertos(st):
+    return sorted((p for p in st["problemas"].values() if p["status"] == "aberto" and p.get("gravidade") != "ruido"), key=ordem)
+
+
+def titulo(p):
+    return p.get("titulo") or p["assinatura"][:60]
+
+
+def tag(p):
+    if p.get("voltou"):
+        return c("255;85;85", "VOLTOU")
+    if p.get("primeira_vez") and now() - parse_iso(p["primeira_vez"]) < timedelta(hours=24):
+        return c("120;200;120", "NOVO")
+    return ""
+
+
+def taxa_txt(p):
+    t = p.get("taxa") or 0
+    return (f"{t:.0f}/h" if t >= 10 else f"{t:g}/h") if t else f"0/h (visto {local_hm(p.get('visto_em'))})"
+
+
+def find(st, n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        die("informe o número do problema (veja: triagem-logs lista)")
+    for k, p in st["problemas"].items():
+        if p["id"] == n:
+            return k, p
+    die(f"problema #{n} não encontrado")
+
+
+def cmd_lista():
+    st = load_state()
+    ab = abertos(st)
+    print(f"{B}Problemas abertos ({len(ab)}){R} {D}· última varredura {local_hm(st['ultima_varredura'])}{R}")
+    cols = shutil.get_terminal_size().columns
+    w_prob = max(30, min(60, cols - 80))
+    linhas = []
+    for p in ab:
+        cel = celulas(p, w_prob)
+        cel.insert(5, (p.get("arquivo") or p.get("frame") or "-").split("/")[-1])
+        linhas.append(cel + [tag(p)])
+    for l in grade(["#", "", "Serviço", "Problema", "Freq.", "Onde", ""], linhas, [3, 2, 8, w_prob, 7, 26, 6],
+                   [">", "^", "<", "<", ">", "<", "<"]):
+        print(l)
+    print(f"{D}  {' '.join(f'{BOLA[k]} {GRAV[k][1].lower()}' for k in ('critico', 'alto', 'medio', 'baixo'))}{R}")
+    cont = {}
+    for p in st["problemas"].values():
+        k = "ruido" if p.get("gravidade") == "ruido" and p["status"] == "aberto" else p["status"]
+        cont[k] = cont.get(k, 0) + 1
+    resto = " · ".join(f"{v} {k}" for k, v in sorted(cont.items()) if k != "aberto")
+    if resto:
+        print(f"{D}  outros: {resto}  (triagem-logs lista --tudo){R}")
+    if "--tudo" in sys.argv:
+        for p in sorted(st["problemas"].values(), key=ordem):
+            if p["status"] != "aberto" or p.get("gravidade") == "ruido":
+                print(f"  {D}{p['id']:>3} [{p['status']}] {p['servico']:<9} {titulo(p)[:60]} · total {p['total']}{situacao(st, p)}{R}")
+
+
+def situacao(st, p):
+    """Para resolvidos: se a correção já foi para produção (container reiniciado depois da marcação)."""
+    if p["status"] != "resolvido" or not p.get("resolvido_em"):
+        return ""
+    dep = (st.get("deploys") or {}).get(p["servico"])
+    if dep and parse_iso(dep) > parse_iso(p["resolvido_em"]):
+        return f" · deploy {parse_iso(dep).astimezone():%d/%m %H:%M}, sem reincidência"
+    return " · aguardando deploy"
+
+
+def cmd_lentos():
+    conf = load_conf()
+    if not conf.get("grafana"):
+        die("Grafana não configurado (rode distro-setup para configurar)")
+    st = load_state()
+    try:
+        itens = lentos(conf)
+        st["lentos"] = {"atualizado": iso(now()), "itens": itens}
+        with Lock():
+            cur = load_state()
+            cur["lentos"] = st["lentos"]
+            save_state(cur)
+            escrever_painel(cur)
+    except Exception as e:
+        print(f"{D}grafana indisponível ({e}); mostrando a última leitura{R}")
+    L = st.get("lentos") or {}
+    itens = L.get("itens") or []
+    print(f"{B}🐢 Endpoints mais lentos (P95){R} {D}· última hora · lido às {local_hm(L.get('atualizado'))}{R}")
+    if not itens:
+        print(f"  {D}nenhum endpoint no painel agora{R}")
+        return
+    linhas = [[it["path"], seg(it["atual"]), seg(it["pico"]), it["controller"] or D + "não achado no repo" + R] for it in itens]
+    for l in grade(["Endpoint", "P95 agora", "Pico 1h", "Controller"], linhas, [38, 9, 9, 50], ["<", ">", ">", "<"]):
+        print(l)
+    print(f"{D}  cores pelos limites do dashboard: verde < 1 s · amarelo < 3 s · vermelho ≥ 3 s{R}")
+
+
+def cmd_ver(n):
+    st = load_state()
+    _, p = find(st, n)
+    _, rot, cor = GRAV[p.get("gravidade")]
+    w = min(shutil.get_terminal_size().columns, 110)
+    wrap = lambda t: "\n".join(textwrap.wrap(t or "-", w - 4, initial_indent="  ", subsequent_indent="  "))
+    print(f"{B}#{p['id']} {titulo(p)}{R}  {BOLA.get(p.get('gravidade'), '⚫')} {c(cor, rot)} {tag(p)}")
+    print(f"{D}{p['servico']} · {p['status']}{situacao(st, p)} · origem: {p.get('origem') or '-'} · {taxa_txt(p)} · total {p['total']} · "
+          f"desde {parse_iso(p['primeira_vez']).astimezone():%d/%m %H:%M}{R}")
+    if p.get("arquivo"):
+        print(f"{B}Arquivo:{R} {p['arquivo']}")
+    print(f"{B}Causa:{R}\n{wrap(p.get('causa'))}\n{B}Correção:{R}\n{wrap(p.get('correcao'))}")
+    print(f"{B}Exemplo do log:{R} {D}({', '.join(p.get('containers', []))}){R}")
+    print(D + "\n".join("  " + l[:w - 4] for l in (p.get("exemplo") or "").splitlines()[:30]) + R)
+
+
+def cmd_status(n, novo):
+    with Lock():
+        st = load_state()
+        k, p = find(st, n)
+        p["status"] = novo
+        p.pop("voltou", None)
+        if novo == "resolvido":
+            p["resolvido_em"] = iso(now())
+        save_state(st)
+        escrever_painel(st)
+    msg = {"resolvido": "resolvido; volta ao painel se reaparecer depois do próximo deploy",
+           "ignorado": "ignorado; não aparece mais", "aberto": "reaberto"}[novo]
+    print(f"\033[32m✓{R} #{p['id']} {titulo(p)}: {msg}")
+
+
+def cmd_corrigir(n):
+    conf = load_conf()
+    st = load_state()
+    _, p = find(st, n)
+    repo = os.path.expanduser(conf["servicos"][p["servico"]]["repo"])
+    prompt = (f"Problema de produção #{p['id']} encontrado nos logs do container {', '.join(p.get('containers', []))} "
+              f"({p.get('taxa', 0)} ocorrências/h, {p['total']} no total).\n\n"
+              f"Título: {titulo(p)}\nGravidade: {p.get('gravidade')}\nArquivo: {p.get('arquivo') or p.get('frame') or '-'}\n"
+              f"Causa provável: {p.get('causa') or '-'}\nCorreção sugerida: {p.get('correcao') or '-'}\n\n"
+              f"Exemplo do log (caminhos /app/... = raiz deste repositório):\n```\n{p.get('exemplo')}\n```\n\n"
+              f"Investigue no código, confirme a causa e proponha a correção antes de alterar. "
+              f"Quando terminar, lembre-me de rodar `triagem-logs resolvido {p['id']}` após o deploy.")
+    os.chdir(repo)
+    if conf["agente"] == "opencode":
+        os.execvp("opencode", ["opencode", "--prompt", prompt])
+    os.execvp("claude", ["claude", prompt])
+
+
+# ---------------------------------------------------------------- painel do terminal
+def vis(s):
+    """Largura visível (sem ANSI; emoji e caracteres largos ocupam 2 colunas)."""
+    import unicodedata
+    s = re.sub(r"\x1b\[[0-9;]*m", "", s)
+    return sum(0 if unicodedata.combining(ch) or ch == "\ufe0f" else 2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
+
+
+def cut(s, n):
+    if vis(s) <= n:
+        return s
+    while vis(s) > n - 1:
+        s = s[:-1]
+    return s + "…"
+
+
+def grade(cab, linhas, larg, alinh=None, separar=True):
+    """Tabela com bordas e separador entre todas as linhas (estilo ┌─┬─┐)."""
+    alinh = alinh or ["<"] * len(cab)
+    BC = "\033[38;5;240m"
+    b = lambda t: f"{BC}{t}{R}"
+
+    def cel(t, w, al):
+        t = cut(t, w)
+        pad = w - vis(t)
+        if al == ">":
+            return " " * pad + t
+        if al == "^":
+            return " " * (pad // 2) + t + " " * (pad - pad // 2)
+        return t + " " * pad
+
+    def lin(cells):
+        return b("│") + b("│").join(" " + cel(t, w, al) + " " for t, w, al in zip(cells, larg, alinh)) + b("│")
+
+    sep = lambda l, m, r: b(l + m.join("─" * (w + 2) for w in larg) + r)
+    out = [sep("┌", "┬", "┐")] + ([lin([B + h + R for h in cab]), sep("├", "┼", "┤")] if cab else [])
+    for i, row in enumerate(linhas):
+        # célula com "\n" ocupa várias linhas dentro da mesma linha da tabela
+        partes = [str(t).split("\n") for t in row]
+        for k in range(max(len(x) for x in partes)):
+            out.append(lin([x[k] if k < len(x) else "" for x in partes]))
+        if i == len(linhas) - 1:
+            out.append(sep("└", "┴", "┘"))
+        elif separar:
+            out.append(sep("├", "┼", "┤"))
+    if not linhas:
+        out[-1] = sep("└", "┴", "┘")
+    return out
+
+
+def celulas(p, w_prob):
+    t = tag(p)
+    prob = (c("255;85;85", "⚠ voltou ") if p.get("voltou") else "") + titulo(p)
+    taxa = p.get("taxa") or 0
+    freq = (f"{taxa:.0f}×/h" if taxa >= 10 else f"{taxa:g}×/h") if taxa else D + "0×/h" + R
+    return [B + str(p["id"]) + R, BOLA.get(p.get("gravidade"), "⚫"), p["servico"], prob, freq]
+
+
+ALTURAS = (16,)  # altura padrão das figuras da saudação (FIG_ALT em ~/.config/bash/greeting.bash)
+
+
+def lentos_linhas(st, g):
+    """Tabela compacta dos endpoints lentos (P95), exibida na saudação ao lado de Pendentes/Concluídas."""
+    L = st.get("lentos") or {}
+    itens = L.get("itens") or []
+    if not L:
+        return []
+    pre = g.get("prefixo", "")
+    nome = f" do {g['servico']}" if g.get("servico") else ""
+    out = [f" 🐢 {B}Endpoints lentos{nome}{R}  " + D + f"P95 · 1 h · {local_hm(L.get('atualizado'))} · triagem-logs lentos" + R]
+    if not itens:
+        return out + ["   " + c("120;200;120", f"✔ nenhum endpoint{nome} no P95")]
+    linhas = [[it["path"][len(pre):] if pre and it["path"].startswith(pre + "/") else it["path"], seg(it["atual"]), seg(it["pico"])]
+              for it in itens[:4]]
+    if len(itens) > 4:
+        linhas[-1][0] = D + f"+{len(itens) - 3} outros (triagem-logs lentos)" + R
+        linhas[-1][1] = linhas[-1][2] = ""
+    # compacta (sem separador entre linhas): fica da altura do bloco Pendentes/Concluídas ao lado
+    return out + grade([f"Endpoint ({pre})" if pre else "Endpoint", "P95", "Pico"], linhas, [38, 6, 6], ["<", ">", ">"], separar=False)
+
+
+def painel_linhas(st, altura):
+    ab = abertos(st)
+    when = local_hm(st.get("ultima_varredura"))
+    atrasada = st.get("ultima_varredura") and now() - parse_iso(st["ultima_varredura"]) > timedelta(hours=2)
+    larg = [2, 2, 8, 38, 7]
+    resolvidos = sum(1 for p in st["problemas"].values() if p["status"] == "resolvido")
+    titulo_l = (f" 🔥 {B}Logs para atacar agora{R}  " +
+                (c("255;150;50", f"⚠ varredura atrasada ({when})") if atrasada else
+                 D + f"{len(ab)} aberto{'s' if len(ab) != 1 else ''} · {resolvidos} resolvido{'s' if resolvidos != 1 else ''} · varredura {when}" + R))
+    corpo = []
+    if ab:
+        linhas = []
+        for p in ab[:3]:
+            cel = celulas(p, larg[3])
+            onde = p.get("arquivo") or p.get("frame") or ""
+            if onde:  # 2ª linha: onde corrigir (mostra o fim do caminho, que é o que importa)
+                onde = onde if vis(onde) <= larg[3] else "…" + onde[-(larg[3] - 1):]
+                cel[3] += "\n" + D + onde + R
+            linhas.append(cel)
+        # figura baixa (14 linhas): sem a linha de cabeçalho das colunas, para caber o rodapé
+        cab = ["#", "", "Serviço", "Problema", "Freq."] if altura >= 16 else None
+        corpo = grade(cab, linhas, larg, [">", "^", "<", "<", ">"])
+        corpo.append(D + "  " + " · ".join(f"{BOLA[k]} {GRAV[k][1].lower()}" for k in ("critico", "alto", "medio", "baixo")) + R)
+        n = ab[0]["id"]
+        fila = f"   {D}+{len(ab) - 3} na fila{R}" if len(ab) > 3 else ""
+        rodape = (f" {c('255;120;80', '▶')} {B}#{n}{R}: {D}triagem-logs{R} ver {B}{n}{R} {D}·{R} corrigir {B}{n}{R}"
+                  f" {D}·{R} resolvido {B}{n}{R}{fila}")
+    else:
+        corpo = ["", "   " + c("120;200;120", "✔ nenhum problema aberto nos logs"), ""]
+        rodape = f" {D}próxima varredura em até 30 min · triagem-logs lista{R}"
+    L = [titulo_l] + corpo + [rodape]
+    # completa a altura da figura com linhas em branco (após o título e antes do rodapé)
+    falta = altura - len(L)
+    if falta > 0:
+        L = [L[0]] + [""] * (falta // 2) + L[1:-1] + [""] * (falta - falta // 2) + [L[-1]]
+    return L
+
+
+def escrever_painel(st):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conf = load_conf()
+    for arq, ativo, linhas in ((PAINEL, conf.get("dozzle"), lambda: painel_linhas(st, max(ALTURAS))),
+                               (STATE_DIR / "lentos.ansi", conf.get("grafana"), lambda: lentos_linhas(st, conf["grafana"]))):
+        if ativo:
+            arq.write_text("\n".join(linhas()) + "\n")
+        else:
+            arq.unlink(missing_ok=True)  # sem Dozzle/Grafana o bloco some da saudação
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] in ("-h", "--help", "ajuda"):
+        print(__doc__.strip())
+    elif not a or a[0] == "--desde" or a[0] == "varrer":
+        desde = a[a.index("--desde") + 1] if "--desde" in a and a.index("--desde") + 1 < len(a) else None
+        varrer(desde)
+    elif a[0] == "lista":
+        cmd_lista()
+    elif a[0] == "ver" and len(a) > 1:
+        cmd_ver(a[1])
+    elif a[0] == "corrigir" and len(a) > 1:
+        cmd_corrigir(a[1])
+    elif a[0] in ("resolvido", "resolver") and len(a) > 1:
+        cmd_status(a[1], "resolvido")
+    elif a[0] == "ignorar" and len(a) > 1:
+        cmd_status(a[1], "ignorado")
+    elif a[0] == "reabrir" and len(a) > 1:
+        cmd_status(a[1], "aberto")
+    elif a[0] == "lentos":
+        cmd_lentos()
+    elif a[0] == "painel":
+        escrever_painel(load_state())
+        if not PAINEL.exists():
+            die("Dozzle não configurado (rode distro-setup para configurar)")
+        sys.stdout.write(PAINEL.read_text())
+    else:
+        die("comando desconhecido (veja: triagem-logs --help)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

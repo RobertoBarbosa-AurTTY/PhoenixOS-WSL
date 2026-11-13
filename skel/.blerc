@@ -1,0 +1,2 @@
+# comando inexistente / erro de sintaxe: apenas texto vermelho, sem fundo
+ble-face -s syntax_error fg=red

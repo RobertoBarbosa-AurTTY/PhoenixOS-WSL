@@ -1,0 +1,19 @@
+---
+description: Escreve agora o handoff da sessão atual na nota do Obsidian
+---
+Escreva o handoff desta sessão.
+
+1. Ache a nota da sessão atual: `ls -t ~/Obsidian\ Vault/Claude/Sessoes/*.md | head -3` (ela tem o id curto desta sessão entre parênteses no nome).
+2. Substitua **apenas** o conteúdo entre `<!-- handoff:inicio -->` e `<!-- handoff:fim -->` por este formato (no máximo ~15 linhas, específico, sem inventar):
+
+**Objetivo:** …
+**Estado:** …
+**Feito:**
+- …
+**Pendências:**
+- …
+**Próximo passo sugerido:** …
+**Cuidados:** …
+
+3. Mude `handoff: nao` para `handoff: sim` no frontmatter.
+4. Mostre o handoff ao usuário.

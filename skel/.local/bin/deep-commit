@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""deep-commit — lê as mudanças, entende o que foi feito e cria um commit profissional.
+Usa o Claude Code em segundo plano (modelo haiku); se ele falhar, usa o opencode
+com um modelo grátis (DEEP_COMMIT_FALLBACK_MODEL, padrão opencode/deepseek-v4.1-flash-free). Não faz push e não faz `git add` de nada além dos arquivos que você passar.
+
+  deep-commit arquivo.py [outro.ts …]   commita SÓ esses arquivos (o resto fica intocado)
+  deep-commit                           commita o que já está em stage
+  deep-commit -n arquivo.py             só a prévia (título e descrição), não commita
+  deep-commit -y arquivo.py             commita direto, sem perguntar
+
+Antes de commitar mostra a prévia e um seletor (←/→ + Enter): Sim · Editar (no $EDITOR) · Refazer · Não
+  deep-commit -m "dica" arquivo.py      dá contexto extra para a IA
+  deep-commit --sem-nota arquivo.py     ignora as notas do Obsidian
+
+Notas de atividade: se houver nota pendente em ~/Obsidian Vault/Claude/Commits/ para
+este repositório (e arquivos), ela é usada para escrever a descrição do commit
+e a nota é marcada como commitada com o hash.
+
+Desfazer o último commit (mantendo as mudanças): git reset --soft HEAD~1
+"""
+import json, os, re, shutil, subprocess, sys, textwrap, threading, time, unicodedata
+from pathlib import Path
+
+MODEL = os.environ.get("DEEP_COMMIT_MODEL", "haiku")  # haiku = rápido; sonnet = mais caprichado
+TIMEOUT = int(os.environ.get("DEEP_COMMIT_TIMEOUT", "90"))
+NOTES = Path(os.environ.get("DEEP_COMMIT_NOTES", Path.home() / "Obsidian Vault/Claude/Commits"))
+FALLBACK_MODEL = os.environ.get("DEEP_COMMIT_FALLBACK_MODEL", "opencode/deepseek-v4.1-flash-free")
+NOISE = ("lock.json", ".lock", "pnpm-lock.yaml", ".min.js", ".map", ".svg")
+
+SYSTEM = """Você é um engenheiro sênior escrevendo a mensagem de commit git perfeita.
+Responda APENAS com a mensagem final: sem aspas, sem crases, sem markdown, sem comentários.
+
+TÍTULO (primeira linha), sempre:
+  tipo(escopo): descrição
+- tipo: feat (criação de algo novo), fix (correção de problema), refactor (melhoria de código sem mudar
+  comportamento), perf (melhoria de desempenho), style, chore, docs, test, build, ci, revert.
+- escopo: arquivo ou módulo principal alterado, curto, minúsculo, sem extensão (ex: orders, math, auth).
+- descrição: português, verbo no presente (adiciona, corrige, remove, ajusta, converte…), minúscula,
+  sem ponto final, título inteiro com até ~72 caracteres. Diga o efeito, não "altera arquivo X".
+Exemplo: fix(orders): converte horário do pagamento para o fuso local
+
+DESCRIÇÃO (corpo), sempre presente: linha em branco depois do título e seções conforme o tipo:
+- fix:
+    Problema: <qual era o problema, onde aparecia e o impacto>
+    <linha em branco>
+    Solução: <o que foi feito para resolver e por quê>
+- feat:
+    Criado: <o que foi criado e para que serve>
+- refactor, perf, style, chore:
+    Melhoria: <o que melhorou e qual o ganho>
+- docs, test, build, ci, revert:
+    Alteração: <o que foi alterado e por quê>
+- Em qualquer tipo, opcional ao final (linha em branco antes):
+    Observações: <validação feita, pontos de atenção, pendências>; omita se não houver nada relevante.
+Cada seção: 1 a 3 frases, ou tópicos "- " se houver várias ações. Começa com letra maiúscula.
+Tom: profissional e corporativo, português formal, impessoal ("Foi identificado que…", "Adicionada…"),
+objetivo, sem emojis, sem primeira pessoa, sem citar IA, Claude ou Obsidian.
+
+Se houver "NOTAS DA ATIVIDADE", elas são a fonte da verdade do porquê (problema, causa, decisão);
+se trouxerem tipo_commit/escopo, use-os. Use o diff para confirmar o que mudou.
+Sem notas, deduza do diff e não invente fatos que o diff não mostre (ex: números, validações)."""
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"\033[31m✗\033[0m {msg}\n")
+    sys.exit(code)
+
+
+def git(*a, check=True):
+    r = subprocess.run(["git", *a], capture_output=True, text=True)
+    if check and r.returncode:
+        die(r.stderr.strip() or f"git {' '.join(a)} falhou")
+    return r.stdout
+
+
+class Spin:
+    def __init__(self, msg):
+        self.msg, self.on = msg, sys.stderr.isatty()
+        if self.on:
+            self.t = threading.Thread(target=self._run, daemon=True)
+            self.t.start()
+
+    def _run(self):
+        i, t0 = 0, time.time()
+        while self.on:
+            sys.stderr.write(f"\r\033[K\033[36m{'⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[i % 10]}\033[0m \033[2m{self.msg} {time.time()-t0:.0f}s\033[0m")
+            sys.stderr.flush()
+            time.sleep(0.08)
+            i += 1
+
+    def stop(self):
+        if self.on:
+            self.on = False
+            self.t.join()
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+
+def parse_note(path):
+    text = path.read_text(errors="replace")
+    m = re.match(r"---\n(.*?)\n---\n?(.*)", text, re.S)
+    if not m:
+        return None
+    meta = {}
+    for line in m.group(1).splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            v = v.strip()
+            try:
+                meta[k.strip()] = json.loads(v) if v.startswith("[") else v.strip('"')
+            except json.JSONDecodeError:
+                meta[k.strip()] = v
+    return {"path": path, "meta": meta, "body": m.group(2).strip()}
+
+
+def find_notes(top, rel_files):
+    """Notas pendentes deste repositório cujos arquivos batem com os do commit."""
+    if not NOTES.is_dir():
+        return []
+    found = []
+    for p in sorted(NOTES.glob("*.md")):
+        n = parse_note(p)
+        if not n or n["meta"].get("status") != "pendente":
+            continue
+        repo = n["meta"].get("repo", "")
+        if not repo or Path(repo).expanduser().resolve() != Path(top).resolve():
+            continue
+        arqs = n["meta"].get("arquivos") or []
+        if arqs and rel_files and not set(arqs) & set(rel_files):
+            continue
+        found.append(n)
+    return found[-5:]
+
+
+def mark_committed(note, sha):
+    text = note["path"].read_text()
+    head, sep, rest = text.partition("\n---\n")
+    head = re.sub(r"(?m)^status:.*$", "status: commitado", head)
+    head = re.sub(r"(?m)^commit:.*\n?", "", head)
+    head += f"\ncommit: {sha}\ncommitado_em: {time.strftime('%Y-%m-%dT%H:%M')}"
+    note["path"].write_text(head + sep + rest)
+
+
+def wrap(msg, width=72):
+    """Quebra o corpo em 72 colunas (padrão git), preservando tópicos."""
+    title, _, body = msg.partition("\n")
+    # garante linha em branco antes de cada seção e maiúscula no início
+    body = re.sub(r"\n*(Problema|Solução|Criado|Melhoria|Alteração|Contexto|Causa|Observações):\s*(\w)",
+                  lambda m: f"\n\n{m.group(1)}: {m.group(2).upper()}", body).strip("\n")
+    body = "\n" + body if body else ""
+    out = []
+    for line in body.splitlines():
+        if len(line) <= width:
+            out.append(line)
+        else:
+            ind = "  " if line.lstrip().startswith("- ") else ""
+            out += textwrap.wrap(line, width, subsequent_indent=ind, break_on_hyphens=False)
+    return title + ("\n" + "\n".join(out) if out else "")
+
+
+class AIError(Exception):
+    pass
+
+
+def clean(out):
+    out = out.strip().strip("`").strip()
+    if out.split("\n", 1)[0].lower() in ("text", "plaintext", "git"):
+        out = out.split("\n", 1)[1].strip() if "\n" in out else ""
+    out = out.strip().strip('"').strip()
+    return re.sub(r"^(\w+):\s*\(", r"\1(", out)  # garante o padrão tipo(escopo)
+
+
+def ask_claude(prompt):
+    """Chama o Claude Code em segundo plano (usa sua assinatura, sem chave de API)."""
+    if not shutil.which("claude"):
+        raise AIError("comando claude não encontrado no PATH")
+    cmd = ["claude", "-p", "--model", MODEL, "--tools", "", "--no-session-persistence",
+           "--settings", '{"disableAllHooks": true}', "--system-prompt", SYSTEM,
+           "Gere a mensagem de commit para as mudanças abaixo."]
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise AIError(f"o Claude não respondeu em {TIMEOUT}s")
+    if r.returncode:
+        raise AIError("claude falhou: " + (r.stderr.strip() or r.stdout.strip())[:300])
+    out = clean(r.stdout)
+    if not out:
+        raise AIError("o Claude devolveu mensagem vazia")
+    return out
+
+
+def ask_opencode(prompt):
+    """Fallback grátis: opencode com modelo do OpenCode Zen, agente plan (não edita) numa pasta vazia."""
+    import tempfile
+    if not shutil.which("opencode"):
+        raise AIError("comando opencode não encontrado no PATH")
+    msg = f"{SYSTEM}\n\nGere a mensagem de commit para as mudanças abaixo.\n\n{prompt}"
+    raw = msg.encode()
+    if len(raw) > 120_000:  # limite de um argumento na linha de comando
+        msg = raw[:120_000].decode(errors="ignore") + "\n… (truncado)"
+    cmd = ["opencode", "run", "--pure", "--agent", "plan", "-m", FALLBACK_MODEL, "--format", "json", msg]
+    with tempfile.TemporaryDirectory(prefix="deep-commit-") as tmp:
+        try:
+            r = subprocess.run(cmd, cwd=tmp, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise AIError(f"o opencode não respondeu em {TIMEOUT}s")
+    texts = []
+    for line in r.stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "text":
+            texts.append(ev.get("part", {}).get("text", ""))
+        elif ev.get("type") == "error":
+            raise AIError("opencode: " + json.dumps(ev.get("error", ev), ensure_ascii=False)[:300])
+    out = clean("".join(texts))
+    if not out:
+        raise AIError("opencode sem resposta: " + (r.stderr.strip() or r.stdout.strip() or f"código {r.returncode}")[:300])
+    return out
+
+
+def ask_ai(prompt, sp=None):
+    """Tenta o Claude; se falhar, cai para o opencode (modelo grátis)."""
+    try:
+        return ask_claude(prompt)
+    except AIError as e1:
+        if sp:
+            sp.msg = "Claude falhou, usando opencode…"
+        try:
+            out = ask_opencode(prompt)
+        except AIError as e2:
+            die(f"{e1}\n  fallback: {e2}")
+        sys.stderr.write(f"\r\033[K\033[33m⚠\033[0m \033[2m{str(e1).splitlines()[0][:150]}; mensagem gerada por {FALLBACK_MODEL}\033[0m\n")
+        return out
+
+
+def dwidth(t):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 0 if unicodedata.combining(c) else 1 for c in t)
+
+
+def preview(msg, footer=None):
+    title, _, body = msg.partition("\n")
+    if not sys.stdout.isatty():
+        print(msg)
+        return
+    lines = body.strip("\n").splitlines()
+    cols = shutil.get_terminal_size().columns
+    inner = max([76] + [dwidth(l) for l in [title, *lines]])  # largura do conteúdo
+    inner = min(inner, cols - 4)
+    D, B, R = "\033[2m", "\033[1m", "\033[0m"
+
+    def row(text, style=""):
+        pad = max(0, inner - dwidth(text))
+        print(f"{D}│{R} {style}{text}{R}{' ' * pad} {D}│{R}")
+
+    def rule(left, label, right):
+        label = f"─ {label} " if label else ""
+        print(f"{D}{left}{label}{'─' * (inner + 2 - dwidth(label))}{right}{R}")
+
+    rule("┌", "Título", "┐")
+    row(title, B)
+    rule("├", "Descrição", "┤")
+    for l in lines or ["(sem descrição)"]:
+        row(l)
+    rule("└", "", "┘")
+    if footer:
+        print(f"{D}{footer}{R}")
+
+
+CHOICES = [("s", "Sim"), ("e", "Editar"), ("r", "Refazer"), ("n", "Não")]
+
+
+def ask_choice():
+    """Seletor com setas ← → (ou Tab) e Enter; letras s/e/r/n funcionam como atalho."""
+    import termios, tty as ttymod
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return "n"
+    out = lambda t: os.write(fd, t.encode())
+    old = termios.tcgetattr(fd)
+    sel = 0
+
+    def draw(final=False):
+        parts = []
+        for i, (_, label) in enumerate(CHOICES):
+            if final and i != sel:
+                continue
+            if i == sel:
+                cor = "32" if CHOICES[i][0] == "s" else "31" if CHOICES[i][0] == "n" else "33"
+                parts.append(f"\033[1;{cor}m❯ {label}\033[0m" if not final else f"\033[1;{cor}m{label}\033[0m")
+            else:
+                parts.append(f"\033[2m  {label}\033[0m")
+        hint = "" if final else "   \033[2m←/→ escolher · Enter confirmar\033[0m"
+        out(f"\r\033[K\033[1mCommitar?\033[0m  " + "   ".join(parts) + hint + ("\n" if final else ""))
+
+    try:
+        ttymod.setcbreak(fd)
+        out("\033[?25l")  # esconde o cursor
+        draw()
+        while True:
+            k = os.read(fd, 8).decode(errors="ignore")
+            if k in ("\x1b[C", "\x1b[B", "\t", "l"):
+                sel = (sel + 1) % len(CHOICES)
+            elif k in ("\x1b[D", "\x1b[A", "\x1b[Z", "h"):
+                sel = (sel - 1) % len(CHOICES)
+            elif k in ("\r", "\n"):
+                break
+            elif k in ("\x1b", "\x03", "q"):
+                sel = len(CHOICES) - 1
+                break
+            elif k.lower() in [c for c, _ in CHOICES]:
+                sel = [c for c, _ in CHOICES].index(k.lower())
+                break
+            else:
+                continue
+            draw()
+        draw(final=True)
+        return CHOICES[sel][0]
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out("\033[?25h")
+        os.close(fd)
+
+
+def main():
+    args, dry, hint, use_notes, yes = sys.argv[1:], False, "", True, False
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    files = []
+    while args:
+        a = args.pop(0)
+        if a == "-n":
+            dry = True
+        elif a == "-y":
+            yes = True
+        elif a == "--sem-nota":
+            use_notes = False
+        elif a == "-m" and args:
+            hint = args.pop(0)
+        elif a == "--":
+            files += args
+            break
+        else:
+            files.append(a.removeprefix("--") if not Path(a).exists() and Path(a.removeprefix("--")).exists() else a)
+
+    if git("rev-parse", "--is-inside-work-tree", check=False).strip() != "true":
+        die("não é um repositório git")
+
+    if files:
+        for f in files:
+            if not Path(f).exists() and not git("ls-files", "--", f).strip():
+                die(f"arquivo não encontrado: {f}")
+            if Path(f).exists() and not git("ls-files", "--", f).strip():
+                git("add", "--intent-to-add", "--", f)  # arquivo novo: git precisa conhecê-lo
+        has_head = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], capture_output=True).returncode == 0
+        ref = ["HEAD"] if has_head else []
+        stat = git("diff", *ref, "--stat", "--", *files)
+        diff = git("diff", *ref, "-U3", "--", *[f for f in files if not f.endswith(NOISE)])
+    else:
+        stat = git("diff", "--cached", "--stat")
+        diff = git("diff", "--cached", "-U3", "--", ".", *[f":(exclude)*{n}" for n in NOISE])
+    if not stat.strip():
+        die("nenhuma mudança " + ("nesses arquivos" if files else "em stage (passe o arquivo: deep-commit arquivo.py)"), 0)
+    if len(diff) > 60_000:
+        diff = diff[:60_000] + "\n… (diff truncado)"
+
+    branch = git("branch", "--show-current", check=False).strip()
+    recent = git("log", "--no-merges", "--format=%s", "-15", check=False).strip()
+    prompt = (f"Branch: {branch}\n\nÚltimos commits do repositório (siga o mesmo estilo):\n{recent or '(nenhum)'}\n\n"
+              f"Arquivos alterados:\n{stat}\nDiff:\n{diff}")
+    if hint:
+        prompt += f"\n\nContexto do autor: {hint}"
+
+    top = git("rev-parse", "--show-toplevel").strip()
+    if files:
+        rel = [os.path.relpath(os.path.abspath(f), top) for f in files]
+    else:
+        rel = git("diff", "--cached", "--name-only").split()
+    notes = find_notes(top, rel) if use_notes else []
+    if notes:
+        prompt += "\n\nNOTAS DA ATIVIDADE (escritas ao concluir o trabalho):\n"
+        for n in notes:
+            m = n["meta"]
+            extra = "".join(f"{k}: {m[k]}\n" for k in ("tipo_commit", "escopo") if m.get(k))
+            prompt += f"\n### {n['path'].stem}\n{extra}{n['body']}\n"
+        for n in notes:
+            sys.stderr.write(f"\033[2m📎 nota: {n['path'].stem}\033[0m\n")
+
+    while True:
+        sp = Spin("analisando mudanças…")
+        try:
+            msg = ask_ai(prompt, sp)
+        finally:
+            sp.stop()
+        if not msg:
+            die("a IA devolveu mensagem vazia")
+        msg = wrap(msg)
+
+        if dry:
+            preview(msg, "prévia: nada foi commitado")
+            return
+        if yes:
+            choice = "s"
+        else:
+            preview(msg)
+            choice = ask_choice()
+        if choice == "r":
+            print()
+            continue
+        if choice not in ("", "s", "sim", "y", "e"):
+            print("\033[2mcancelado: nada foi commitado\033[0m")
+            return
+        break
+
+    edit = choice == "e"
+    cmd = ["git", "commit", "-q", "-m", msg] + (["-e"] if edit else []) + (["--", *files] if files else [])
+    r = subprocess.run(cmd, capture_output=not edit, text=True)
+    if r.returncode:
+        die((r.stderr or "").strip() or (r.stdout or "").strip() or "commit cancelado")
+    if edit:
+        msg = git("log", "-1", "--format=%B").strip()
+    sha = git("rev-parse", "--short", "HEAD").strip()
+    for n in notes:
+        mark_committed(n, sha)
+    first, _, rest = msg.partition("\n")
+    print(f"\033[32m✓\033[0m \033[2m{sha}\033[0m \033[1m{first}\033[0m")
+    if rest.strip():
+        print("\n\033[2m" + rest.strip() + "\033[0m")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\r\033[K")
+        sys.exit(130)

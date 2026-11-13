@@ -1,0 +1,40 @@
+{
+  "theme": "dark",
+  "cleanupPeriodDays": 90,
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/obsidian-memory.py save",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/obsidian-memory.py load",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/obsidian-memory.py handoff",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

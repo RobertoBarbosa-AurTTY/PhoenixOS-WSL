@@ -1,0 +1,5 @@
+# Uma regex por linha (sem diferenciar maiúsculas). Grupos cujo título ou exemplo casarem
+# com alguma regra são descartados antes da análise. Linhas com # são comentários.
+# Exemplos:
+# Nenhum pedido encontrado
+# socket hang up

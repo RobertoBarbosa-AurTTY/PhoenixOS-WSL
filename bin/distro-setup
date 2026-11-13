@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# distro-setup — assistente de configuração da distro.
+# Roda sozinho na primeira vez que o usuário abre o terminal (chamado pelo ~/.bashrc).
+# Para refazer a qualquer momento: distro-setup
+#
+# Pergunta:
+#   1. nome/e-mail do git (se ainda não houver)
+#   2. agente de IA (Claude Code e/ou opencode) e faz o login com a conta da pessoa
+#   3. link do Dozzle (opcional): sem ele, o painel "Logs para atacar agora" não aparece
+#   4. link do Grafana (opcional): sem ele, o painel "Endpoints lentos" não aparece
+# Sem Dozzle/Grafana a saudação mostra só o padrão: a figura e Pendentes/Concluídas.
+#
+# Grava:
+#   ~/.config/distro/config.env          (lido pela saudação: DOZZLE_URL, GRAFANA_URL, AGENTE)
+#   ~/.config/triagem-logs/config.json   (só se houver Dozzle ou Grafana)
+#   liga/desliga o triagem-logs.timer
+set -uo pipefail
+
+CONF_DIR=~/.config/distro
+CONF=$CONF_DIR/config.env
+TRIAGEM_CONF=~/.config/triagem-logs/config.json
+TRIAGEM_STATE=~/.local/state/triagem-logs
+VAULT=~/"Obsidian Vault"
+
+B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' OK=$'\e[32m✔\e[0m' ERR=$'\e[31m✗\e[0m' AV=$'\e[33m!\e[0m'
+titulo() { printf '\n%s── %s ──%s\n' "$B" "$1" "$R"; }
+pergunta() {  # pergunta "texto" "padrão" -> $RESP
+    local p=$1 def=${2-}
+    if [[ -n $def ]]; then read -r -e -p "$p ${D}[$def]${R}: " -i "" RESP; RESP=${RESP:-$def}
+    else read -r -e -p "$p: " RESP; fi
+}
+sim_nao() {  # sim_nao "texto" s|n -> 0 = sim
+    local def=${2:-s} r
+    read -r -p "$1 ${D}[$( [[ $def == s ]] && echo S/n || echo s/N )]${R}: " r
+    r=${r:-$def}; [[ ${r,,} == s* || ${r,,} == y* ]]
+}
+escolher() {  # escolher "título" [-m] opções... -> linhas escolhidas em $ESCOLHA
+    local t=$1; shift; local multi=; [[ ${1-} == -m ]] && { multi=1; shift; }
+    if command -v fzf >/dev/null; then
+        ESCOLHA=$(printf '%s\n' "$@" | fzf --height=~15 --reverse --prompt="$t > " \
+            ${multi:+--multi --header="TAB marca · Enter confirma"} ${multi:---header="Enter confirma"}) || ESCOLHA=
+    else
+        local i=1 o; for o in "$@"; do printf '  %d) %s\n' $i "$o"; ((i++)); done
+        local r; read -r -p "$t (número${multi:+s separados por espaço}): " r; ESCOLHA=
+        for i in $r; do [[ $i =~ ^[0-9]+$ ]] && (( i >= 1 && i <= $# )) && ESCOLHA+="${!i}"$'\n'; done
+        ESCOLHA=${ESCOLHA%$'\n'}
+    fi
+}
+url_ok() { curl -s -o /dev/null -m 8 -w '%{http_code}' "$1" | grep -qE '^[23]'; }
+
+# valores atuais (para refazer a configuração)
+AGENTE= DOZZLE_URL= GRAFANA_URL=
+[[ -r $CONF ]] && source "$CONF"
+
+clear 2>/dev/null
+cat <<EOF
+${B}PhoenixOS · configuração${R}
+Vou fazer até 4 perguntas. Enter aceita o valor entre colchetes; dá para refazer
+tudo depois com ${B}distro-setup${R}.
+EOF
+[[ ${1-} == --primeira-vez ]] && echo "${D}(se fechar agora, ele aparece de novo na próxima vez que abrir o terminal)${R}"
+
+# ------------------------------------------------------------------ 1. git
+titulo "1/4 · Git"
+nome=$(git config --global user.name 2>/dev/null) email=$(git config --global user.email 2>/dev/null)
+if [[ -n $nome && -n $email ]] && ! sim_nao "Git já está como ${B}$nome <$email>${R}. Trocar?" n; then
+    echo "$OK mantido"
+else
+    pergunta "Seu nome (para os commits)" "$nome"; [[ -n $RESP ]] && git config --global user.name "$RESP"
+    pergunta "Seu e-mail do git" "$email"; [[ -n $RESP ]] && git config --global user.email "$RESP"
+    echo "$OK git configurado"
+fi
+if [[ ! -f ~/.ssh/id_ed25519 ]] && sim_nao "Criar uma chave SSH (para clonar do GitHub/GitLab)?" s; then
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    ssh-keygen -t ed25519 -N "" -C "$(git config --global user.email)" -f ~/.ssh/id_ed25519 >/dev/null
+    echo "$OK chave criada. Cadastre esta chave pública no GitHub/GitLab (Settings → SSH keys):"
+    echo; cat ~/.ssh/id_ed25519.pub; echo
+    read -r -p "${D}Enter para continuar…${R}"
+fi
+
+# ------------------------------------------------------------------ 2. agente
+titulo "2/4 · Agente de IA"
+echo "O agente faz a memória das sessões (Pendentes/Concluídas) e a triagem dos logs."
+echo "Cada pessoa entra com a ${B}própria conta${R}."
+escolher "Agente" "claude   — Claude Code (memória no Obsidian + triagem)" \
+                  "opencode — opencode (triagem dos logs; sem a memória de sessões)" \
+                  "ambos    — Claude Code e opencode" \
+                  "nenhum   — configurar depois"
+case ${ESCOLHA%% *} in claude|opencode|ambos) usa=${ESCOLHA%% *} ;; *) usa=nenhum ;; esac
+
+if [[ $usa == claude || $usa == ambos ]]; then
+    if ! command -v claude >/dev/null; then
+        echo "Instalando o Claude Code (instalador oficial)…"
+        curl -fsSL https://claude.ai/install.sh | bash || echo "$ERR falhou a instalação; tente de novo com distro-setup"
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+    if command -v claude >/dev/null; then
+        if claude auth status 2>/dev/null | grep -q '"loggedIn": true'; then echo "$OK Claude Code já está logado"
+        else echo "Abrindo o login do Claude Code (abra o link no navegador e cole o código)…"; claude auth login || true; fi
+    fi
+fi
+if [[ $usa == opencode || $usa == ambos ]]; then
+    if ! command -v opencode >/dev/null; then
+        echo "$AV opencode não está instalado. Instale com:  ${B}sudo npm i -g opencode-ai${R}  e rode distro-setup de novo."
+    elif opencode auth list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -qE '[1-9][0-9]* credentials'; then
+        echo "$OK opencode já tem credencial"
+        sim_nao "Adicionar outro provedor no opencode?" n && opencode auth login
+    else
+        echo "Login no opencode (escolha o provedor; 'opencode' tem modelos grátis)…"; opencode auth login || true
+    fi
+fi
+case $usa in
+    claude|opencode) AGENTE=$usa ;;
+    ambos) escolher "Quem faz a triagem dos logs?" "claude" "opencode"; AGENTE=${ESCOLHA:-claude} ;;
+    *) AGENTE= ;;
+esac
+
+# ------------------------------------------------------------------ 3. Dozzle
+titulo "3/4 · Dozzle (logs dos containers) — opcional"
+echo "Com o Dozzle, a saudação mostra os erros dos logs já classificados pelo agente."
+echo "${D}Sem ele (Enter vazio), esse painel não aparece.${R}"
+servicos_json="{}" nomes_servicos=()
+while :; do
+    pergunta "Link do Dozzle (ex: http://10.0.0.5:8080)" "$DOZZLE_URL"
+    DOZZLE_URL=${RESP%/}
+    [[ -z $DOZZLE_URL || $DOZZLE_URL == - ]] && { DOZZLE_URL=; echo "$D— sem Dozzle$R"; break; }
+    [[ $DOZZLE_URL == http* ]] || DOZZLE_URL="http://$DOZZLE_URL"
+    lista=$(python3 -I - "$DOZZLE_URL" <<'PY' 2>/dev/null
+import json, sys, urllib.request
+req = urllib.request.Request(sys.argv[1] + "/api/events/stream", headers={"Accept": "text/event-stream"})
+ev = None
+with urllib.request.urlopen(req, timeout=15) as r:
+    for raw in r:
+        l = raw.decode(errors="replace").rstrip("\n")
+        if l.startswith("event:"): ev = l[6:].strip()
+        elif l.startswith("data:") and ev == "containers-changed":
+            for c in sorted(json.loads(l[5:]), key=lambda c: c.get("name", "")):
+                if c.get("state") == "running": print(c["name"])
+            break
+PY
+)
+    if [[ -n $lista ]]; then break; fi
+    echo "$ERR não consegui ler os containers desse link (rede/VPN? link errado?)"
+    sim_nao "Tentar outro link?" s || { DOZZLE_URL=; break; }
+done
+if [[ -n $DOZZLE_URL ]]; then
+    # agrupa réplicas: app-app-1, app-app-2 -> ^app-app-\d+$
+    mapfile -t bases < <(sed -E 's/-[0-9]+$//' <<<"$lista" | sort -u)
+    echo "$OK ${#bases[@]} container(s) encontrado(s). Marque os que você quer monitorar:"
+    escolher "Containers" -m "${bases[@]}"
+    mapfile -t marcados <<<"$ESCOLHA"
+    servicos_json=$(
+        for base in "${marcados[@]}"; do
+            [[ -z $base ]] && continue
+            nome=${base%%-*}                       # projeto do compose (app-app -> app)
+            [[ $base == "$nome-$nome" || $base == "$nome" ]] || nome=$base
+            pergunta "  Repositório de ${B}$nome${R} (pasta local do código)" "~/clones/$nome" </dev/tty >/dev/tty
+            repo=$RESP
+            [[ -d ${repo/#\~/$HOME} ]] || echo "  $AV a pasta $repo ainda não existe; clone o repositório lá depois" >/dev/tty
+            regex="^$(sed 's/[.[\*^$()+?{|]/\\&/g' <<<"$base")"
+            grep -qE -- "^$base-[0-9]+$" <<<"$lista" && regex+='-\d+$' || regex+='$'
+            printf '%s\t%s\t%s\n' "$nome" "$regex" "$repo"
+        done | python3 -I -c '
+import json, sys
+s = {}
+for l in sys.stdin:
+    n, rx, repo = l.rstrip("\n").split("\t")
+    s[n] = {"container": rx, "repo": repo}
+print(json.dumps(s))')
+    mapfile -t nomes_servicos < <(python3 -I -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])))' "$servicos_json")
+    (( ${#nomes_servicos[@]} )) || { echo "$AV nenhum container marcado: Dozzle desativado"; DOZZLE_URL=; }
+    [[ -n $DOZZLE_URL && -z $AGENTE ]] && echo "$AV sem agente, os erros aparecem sem classificação (configure um agente depois)"
+fi
+
+# ------------------------------------------------------------------ 4. Grafana
+titulo "4/4 · Grafana (endpoints lentos) — opcional"
+echo "Use um ${B}dashboard público${R} (Grafana → Share → Public dashboard) com um painel de latência por endpoint."
+echo "${D}Sem ele (Enter vazio), esse painel não aparece.${R}"
+grafana_json=null
+while :; do
+    pergunta "Link do dashboard público (…/public-dashboards/<token>)" "$GRAFANA_URL"
+    GRAFANA_URL=$RESP
+    [[ -z $GRAFANA_URL || $GRAFANA_URL == - ]] && { GRAFANA_URL=; echo "$D— sem Grafana$R"; break; }
+    if [[ $GRAFANA_URL =~ ^(https?://[^/]+(/[^?]*)?)/public-dashboards/([0-9a-f]+) ]]; then
+        g_base=${BASH_REMATCH[1]} g_token=${BASH_REMATCH[3]}
+        paineis=$(curl -s -m 10 "$g_base/api/public/dashboards/$g_token" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin); d = d.get("dashboard", d)
+def walk(ps):
+    for p in ps:
+        if p.get("type") in ("bargauge", "table", "timeseries", "barchart"):
+            print("%4s  %s  (%s)" % (p["id"], p.get("title", ""), p["type"]))
+        walk(p.get("panels", []))
+walk(d.get("panels", []))' 2>/dev/null)
+        [[ -n $paineis ]] && break
+        echo "$ERR não consegui abrir esse dashboard (é público? a rede alcança?)"
+    else
+        echo "$ERR o link precisa ter /public-dashboards/<token>"
+    fi
+    sim_nao "Tentar outro link?" s || { GRAFANA_URL=; break; }
+done
+if [[ -n $GRAFANA_URL ]]; then
+    mapfile -t ps <<<"$paineis"
+    escolher "Painel com a latência por endpoint (P95)" "${ps[@]}"
+    g_painel=$(awk '{print $1}' <<<"$ESCOLHA")
+    if [[ -z $g_painel ]]; then
+        echo "$AV nenhum painel escolhido: Grafana desativado"; GRAFANA_URL=
+    else
+        pergunta "Mostrar só endpoints com este prefixo (ex: /api; Enter = todos)" "-"
+        g_prefixo=${RESP#-}; g_prefixo=${g_prefixo%/}
+        g_servico=
+        if (( ${#nomes_servicos[@]} )); then
+            escolher "Esses endpoints são de qual serviço? (acha o controller no repositório)" "${nomes_servicos[@]}" "nenhum"
+            [[ $ESCOLHA != nenhum ]] && g_servico=$ESCOLHA
+        fi
+        grafana_json=$(python3 -I -c 'import json,sys; u,t,p,pre,s=sys.argv[1:]
+print(json.dumps({"url": u, "dashboard": t, "painel": int(p), "prefixo": pre, "servico": s, "janela": "now-1h"}))' \
+            "$g_base" "$g_token" "$g_painel" "$g_prefixo" "$g_servico")
+    fi
+fi
+
+# ------------------------------------------------------------------ gravar
+mkdir -p "$CONF_DIR"
+cat > "$CONF" <<EOF
+# gerado pelo distro-setup em $(date '+%F %T') — refaça com: distro-setup
+AGENTE=$AGENTE
+DOZZLE_URL=$DOZZLE_URL
+GRAFANA_URL=$GRAFANA_URL
+EOF
+
+if [[ -n $DOZZLE_URL || -n $GRAFANA_URL ]]; then
+    mkdir -p "${TRIAGEM_CONF%/*}"
+    python3 -I -c 'import json,sys; d,a,s,g,dst=sys.argv[1:]
+c = {"dozzle": d, "agente": a, "servicos": json.loads(s)}
+if g != "null": c["grafana"] = json.loads(g)
+open(dst, "w").write(json.dumps(c, indent=2, ensure_ascii=False) + "\n")' \
+        "$DOZZLE_URL" "$AGENTE" "$servicos_json" "$grafana_json" "$TRIAGEM_CONF"
+else
+    rm -f "$TRIAGEM_CONF"
+fi
+[[ -z $DOZZLE_URL ]] && rm -f "$TRIAGEM_STATE/painel.ansi"
+[[ -z $GRAFANA_URL ]] && rm -f "$TRIAGEM_STATE/lentos.ansi"
+
+# varredura automática a cada 30 min: só com Dozzle
+if systemctl --user cat triagem-logs.timer >/dev/null 2>&1; then
+    if [[ -n $DOZZLE_URL ]]; then systemctl --user enable --now triagem-logs.timer >/dev/null 2>&1
+    else systemctl --user disable --now triagem-logs.timer >/dev/null 2>&1; fi
+fi
+# 1ª leitura agora (em segundo plano) para o painel já vir preenchido
+if [[ -n $DOZZLE_URL || -n $GRAFANA_URL ]] && command -v triagem-logs >/dev/null; then
+    if [[ -n $DOZZLE_URL ]]; then (triagem-logs >/dev/null 2>&1 &)
+    else (triagem-logs lentos >/dev/null 2>&1 &); fi
+fi
+
+# memória no Obsidian (Pendentes/Concluídas)
+mkdir -p "$VAULT/Claude/"{Problemas,Sessoes,Temas,Commits}
+[[ -f ~/.claude/hooks/obsidian-memory.py ]] && python3 ~/.claude/hooks/obsidian-memory.py painel >/dev/null 2>&1
+
+titulo "Pronto"
+printf '  Agente:  %s\n  Dozzle:  %s\n  Grafana: %s\n' "${AGENTE:-nenhum}" "${DOZZLE_URL:-— (painel de logs oculto)}" "${GRAFANA_URL:-— (painel de lentos oculto)}"
+echo "  Refazer: ${B}distro-setup${R}"
+[[ ${1-} == --primeira-vez ]] && { read -r -p "${D}Enter para abrir o terminal…${R}"; clear 2>/dev/null; }
+exit 0

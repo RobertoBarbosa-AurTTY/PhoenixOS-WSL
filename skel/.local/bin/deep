@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""deep — IA de prontidão no terminal (DeepSeek via NVIDIA API).
+
+  deep ola                  pergunta rápida (resposta em streaming)
+  deep faça X no arquivo Y  edita arquivos do diretório atual (só barra de progresso)
+  cat log | deep explica    manda stdin junto
+  deep                      modo conversa (Ctrl+D sai)
+  deep -c ...               continua a última conversa
+  deep --diff / --undo      vê / desfaz as edições da última execução
+  deep --setup / --models   configura a chave / lista modelos
+"""
+import difflib, getpass, json, os, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
+from pathlib import Path
+
+BASE = os.environ.get("DEEP_BASE_URL", "https://integrate.api.nvidia.com/v1")
+CFG_DIR = Path.home() / ".config/deep"
+CFG = CFG_DIR / "config.json"
+CACHE = Path.home() / ".cache/deep"
+MAX_STEPS = 30
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".cache", "target"}
+
+
+def load_cfg():
+    cfg = json.loads(CFG.read_text()) if CFG.exists() else {}
+    cfg["api_key"] = os.environ.get("NVIDIA_API_KEY") or cfg.get("api_key")
+    cfg["model"] = os.environ.get("DEEP_MODEL") or cfg.get("model") or "deepseek-ai/deepseek-v4-flash"
+    return cfg
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"\033[31m✗\033[0m {msg}\n")
+    sys.exit(code)
+
+
+def http(method, path, key, body=None, stream=False):
+    req = urllib.request.Request(
+        BASE + path, method=method,
+        data=json.dumps(body).encode() if body else None,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                 "Accept": "text/event-stream" if stream else "application/json"})
+    try:
+        return urllib.request.urlopen(req, timeout=180)
+    except urllib.error.HTTPError as e:
+        die(f"API {e.code}: {e.read().decode(errors='replace')[:500]}")
+    except urllib.error.URLError as e:
+        die(f"sem conexão com {BASE}: {e.reason}")
+
+
+# ---------------------------------------------------------------- UI
+class UI:
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self):
+        self.msg, self.on, self.agent, self.n, self.t = "", False, False, 0, None
+        self.tty = sys.stderr.isatty()
+
+    def start(self, msg):
+        self.msg = msg
+        if self.on:
+            return
+        self.on = True
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def stop(self):
+        if not self.on:
+            return
+        self.on = False
+        self.t.join()
+        if self.tty:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+    def _run(self):
+        i, W = 0, 14
+        while self.on:
+            if self.tty:
+                cols = shutil.get_terminal_size().columns
+                f = self.FRAMES[i % len(self.FRAMES)]
+                if self.agent:
+                    span = W - 4
+                    p = i % (2 * span)
+                    p = p if p < span else 2 * span - p
+                    bar = "░" * p + "████" + "░" * (span - p)
+                    head = f"{f} [{bar}] {self.n} ações · "
+                    line = f"\033[36m{f}\033[0m [\033[36m{bar}\033[0m] {self.n} ações · "
+                else:
+                    head = line = f"{f} "
+                    line = f"\033[36m{f}\033[0m "
+                msg = self.msg[: max(10, cols - len(head) - 2)]
+                sys.stderr.write(f"\r\033[K{line}\033[2m{msg}\033[0m")
+                sys.stderr.flush()
+            time.sleep(0.08)
+            i += 1
+
+
+# ---------------------------------------------------------------- tools
+ROOT = Path.cwd().resolve()
+originals = {}  # caminho -> conteúdo original (None = arquivo novo)
+
+
+def safe(p):
+    q = (ROOT / p).expanduser().resolve()
+    if q != ROOT and ROOT not in q.parents:
+        raise ValueError(f"{p} está fora do diretório atual ({ROOT})")
+    return q
+
+
+def remember(q):
+    if str(q) not in originals:
+        originals[str(q)] = q.read_text(errors="replace") if q.exists() else None
+
+
+def t_list_files(path=".", **_):
+    base, out = safe(path), []
+    for d, dirs, files in os.walk(base):
+        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and not x.startswith("."))
+        for f in sorted(files):
+            out.append(str((Path(d) / f).relative_to(ROOT)))
+            if len(out) >= 400:
+                return "\n".join(out) + "\n… (truncado)"
+    return "\n".join(out) or "(vazio)"
+
+
+def t_read_file(path, **_):
+    q = safe(path)
+    data = q.read_text(errors="replace")
+    return data if len(data) < 200_000 else data[:200_000] + "\n… (truncado)"
+
+
+def t_write_file(path, content, **_):
+    q = safe(path)
+    remember(q)
+    q.parent.mkdir(parents=True, exist_ok=True)
+    q.write_text(content)
+    return "ok"
+
+
+def t_edit_file(path, old_string, new_string, replace_all=False, **_):
+    q = safe(path)
+    data = q.read_text()
+    n = data.count(old_string)
+    if n == 0:
+        return "ERRO: old_string não encontrado; leia o arquivo e copie o trecho exato"
+    if n > 1 and not replace_all:
+        return f"ERRO: old_string aparece {n} vezes; inclua mais contexto ou use replace_all"
+    remember(q)
+    q.write_text(data.replace(old_string, new_string) if replace_all else data.replace(old_string, new_string, 1))
+    return "ok"
+
+
+def t_search(pattern, path=".", **_):
+    q = safe(path)
+    if shutil.which("rg"):
+        cmd = ["rg", "-n", "--max-count", "30", "--max-columns", "200", "--", pattern, str(q)]
+    else:
+        cmd = ["grep", "-rnI", "--exclude-dir=.git", "--exclude-dir=node_modules", "--", pattern, str(q)]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+    out = out.replace(str(ROOT) + "/", "")
+    return (out[:10_000] + "\n… (truncado)") if len(out) > 10_000 else (out or "(nada encontrado)")
+
+
+def fn(name, desc, props, req):
+    return {"type": "function", "function": {"name": name, "description": desc,
+            "parameters": {"type": "object", "properties": props, "required": req}}}
+
+
+S = {"type": "string"}
+TOOLS = [
+    fn("list_files", "Lista arquivos (recursivo) a partir de um caminho relativo ao diretório atual.", {"path": S}, []),
+    fn("read_file", "Lê o conteúdo de um arquivo.", {"path": S}, ["path"]),
+    fn("search", "Busca regex no código (ripgrep). Retorna arquivo:linha:texto.", {"pattern": S, "path": S}, ["pattern"]),
+    fn("edit_file", "Substitui um trecho EXATO e único do arquivo por outro.",
+       {"path": S, "old_string": S, "new_string": S, "replace_all": {"type": "boolean"}}, ["path", "old_string", "new_string"]),
+    fn("write_file", "Cria ou sobrescreve um arquivo inteiro.", {"path": S, "content": S}, ["path", "content"]),
+]
+IMPL = {"list_files": t_list_files, "read_file": t_read_file, "write_file": t_write_file,
+        "edit_file": t_edit_file, "search": t_search}
+LABEL = {"list_files": "listando", "read_file": "lendo", "write_file": "escrevendo",
+         "edit_file": "editando", "search": "buscando"}
+
+
+def system_prompt():
+    try:
+        top = sorted(p.name + ("/" if p.is_dir() else "") for p in ROOT.iterdir() if not p.name.startswith("."))[:50]
+    except OSError:
+        top = []
+    return (
+        "Você é o deep, assistente de prontidão no terminal (Arch Linux no WSL2).\n"
+        f"Diretório atual: {ROOT}\nConteúdo: {' '.join(top)}\n\n"
+        "Regras:\n"
+        "- Responda em português, curto e direto. Saída é terminal: evite markdown pesado, sem tabelas.\n"
+        "- Pergunta ou conversa: responda direto, SEM usar ferramentas.\n"
+        "- Pedido para criar/alterar arquivos ou código: use as ferramentas sem narrar antes. "
+        "Leia antes de editar; prefira edit_file com trechos exatos e únicos.\n"
+        "- Depois de alterar arquivos, termine com UMA única linha resumindo o que mudou."
+    )
+
+
+# ---------------------------------------------------------------- loop
+def turn(cfg, msgs, ui, live):
+    body = {"model": cfg["model"], "messages": msgs, "tools": TOOLS, "stream": True,
+            "temperature": 0.3, "max_tokens": 8192}
+    content, reasoning, calls, printed = [], [], {}, False
+    with http("POST", "/chat/completions", cfg["api_key"], body, stream=True) as r:
+        for raw in r:
+            line = raw.decode(errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                ch = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not ch.get("choices"):
+                continue
+            d = ch["choices"][0].get("delta") or {}
+            if d.get("reasoning_content"):
+                reasoning.append(d["reasoning_content"])
+            if d.get("content"):
+                content.append(d["content"])
+                if live:
+                    if not printed:
+                        ui.stop()
+                        printed = True
+                    sys.stdout.write(d["content"])
+                    sys.stdout.flush()
+            for tc in d.get("tool_calls") or []:
+                c = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
+                f = tc.get("function") or {}
+                c["id"] = tc.get("id") or c["id"]
+                c["name"] = c["name"] or f.get("name") or ""
+                c["args"] += f.get("arguments") or ""
+                if not printed:
+                    ui.msg = f"preparando {LABEL.get(c['name'], c['name'])}…"
+    return "".join(content), "".join(reasoning), [calls[k] for k in sorted(calls)], printed
+
+
+def run(cfg, msgs):
+    ui, acted = UI(), False
+    ui.start("pensando…")
+    try:
+        for step in range(MAX_STEPS):
+            text, reasoning, calls, printed = turn(cfg, msgs, ui, live=not acted)
+            msg = {"role": "assistant", "content": text}
+            if reasoning:
+                msg["reasoning_content"] = reasoning
+            if calls:
+                msg["tool_calls"] = [{"id": c["id"] or f"call_{step}_{i}", "type": "function",
+                                      "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
+                                     for i, c in enumerate(calls)]
+            msgs.append(msg)
+            if not calls:
+                ui.stop()
+                if printed:
+                    print()
+                elif acted:
+                    summary(text)
+                else:
+                    print(text.strip())
+                return
+            if printed:
+                print()
+            acted, ui.agent = True, True
+            ui.start("trabalhando…")
+            for tc in msg["tool_calls"]:
+                name = tc["function"]["name"]
+                try:
+                    args = json.loads(tc["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                ui.msg = f"{LABEL.get(name, name)} {args.get('path') or args.get('pattern') or ''}".strip()
+                try:
+                    result = IMPL[name](**args) if name in IMPL else f"ERRO: ferramenta {name} não existe"
+                except Exception as e:
+                    result = f"ERRO: {e}"
+                ui.n += 1
+                msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
+            ui.msg = "pensando…"
+        ui.stop()
+        summary("parei: limite de passos atingido")
+    except KeyboardInterrupt:
+        ui.stop()
+        if originals:
+            summary("interrompido")
+        sys.exit(130)
+    finally:
+        ui.stop()
+        save_undo()
+
+
+def summary(text):
+    line = (text.strip().splitlines() or ["pronto"])[-1]
+    print(f"\033[32m✓\033[0m {line}")
+    for path, old in originals.items():
+        q = Path(path)
+        new = q.read_text(errors="replace") if q.exists() else ""
+        diff = list(difflib.unified_diff((old or "").splitlines(), new.splitlines(), lineterm="", n=0))
+        add = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+        rem = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+        tag = " (novo)" if old is None else ""
+        print(f"  \033[2m{os.path.relpath(path)}{tag}\033[0m \033[32m+{add}\033[0m \033[31m−{rem}\033[0m")
+
+
+def save_undo():
+    if originals:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        (CACHE / "undo.json").write_text(json.dumps(originals))
+
+
+def cmd_diff():
+    f = CACHE / "undo.json"
+    if not f.exists():
+        die("nenhuma edição registrada")
+    out = []
+    for path, old in json.loads(f.read_text()).items():
+        q = Path(path)
+        new = q.read_text(errors="replace") if q.exists() else ""
+        out += difflib.unified_diff((old or "").splitlines(keepends=True), new.splitlines(keepends=True),
+                                    fromfile=f"a{path}", tofile=f"b{path}")
+    text = "".join(out) or "(sem diferenças)\n"
+    if shutil.which("bat") and sys.stdout.isatty():
+        subprocess.run(["bat", "-l", "diff", "--style=plain", "--paging=never"], input=text, text=True)
+    else:
+        sys.stdout.write(text)
+
+
+def cmd_undo():
+    f = CACHE / "undo.json"
+    if not f.exists():
+        die("nada para desfazer")
+    for path, old in json.loads(f.read_text()).items():
+        q = Path(path)
+        if old is None:
+            q.unlink(missing_ok=True)
+            print(f"  removido  {path}")
+        else:
+            q.write_text(old)
+            print(f"  restaurado {path}")
+    f.unlink()
+
+
+def models(key):
+    with http("GET", "/models", key) as r:
+        return sorted(m["id"] for m in json.load(r).get("data", []))
+
+
+def cmd_setup():
+    key = getpass.getpass("Chave da NVIDIA (nvapi-…, não aparece na tela): ").strip()
+    if not key:
+        die("chave vazia")
+    ids = models(key)
+    cand = [m for m in ids if "deepseek" in m.lower()]
+    pick = next((m for m in cand if "v4" in m.lower() and "flash" in m.lower()), None)
+    if not pick:
+        print("DeepSeek disponíveis:\n  " + "\n  ".join(cand or ["(nenhum)"]))
+        pick = input("ID do modelo: ").strip()
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    CFG.write_text(json.dumps({"api_key": key, "model": pick}, indent=2))
+    CFG.chmod(0o600)
+    print(f"\033[32m✓\033[0m salvo em {CFG} · modelo {pick}")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    if args and args[0] == "--setup":
+        return cmd_setup()
+    if args and args[0] == "--diff":
+        return cmd_diff()
+    if args and args[0] == "--undo":
+        return cmd_undo()
+    cfg = load_cfg()
+    if not cfg["api_key"]:
+        die("sem chave. Rode: deep --setup")
+    if args and args[0] == "--models":
+        print("\n".join(models(cfg["api_key"])))
+        return
+    cont = bool(args) and args[0] == "-c"
+    if cont:
+        args = args[1:]
+
+    hist = CACHE / "last.json"
+    msgs = [{"role": "system", "content": system_prompt()}]
+    if cont and hist.exists():
+        msgs += json.loads(hist.read_text())
+
+    prompt = " ".join(args).strip()
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read()
+        prompt = f"{prompt or 'Analise isto:'}\n\n```\n{piped[:150_000]}\n```"
+
+    def go(p):
+        msgs.append({"role": "user", "content": p})
+        run(cfg, msgs)
+        CACHE.mkdir(parents=True, exist_ok=True)
+        convo = [m for m in msgs if m["role"] != "system"]
+        convo = convo[-40:]
+        while convo and convo[0]["role"] != "user":  # não começar no meio de uma chamada de ferramenta
+            convo.pop(0)
+        hist.write_text(json.dumps(convo))
+
+    if prompt:
+        return go(prompt)
+    # modo conversa
+    while True:
+        try:
+            p = input("\033[36mdeep›\033[0m ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if p:
+            go(p)
+
+
+if __name__ == "__main__":
+    main()

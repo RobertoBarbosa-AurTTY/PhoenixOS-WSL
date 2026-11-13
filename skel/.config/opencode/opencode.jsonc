@@ -1,0 +1,4 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/deepseek-v4.1-flash-free"  // antes: nvidia/deepseek-ai/deepseek-v4.1-flash (fila de ~200 s no plano grátis)
+}

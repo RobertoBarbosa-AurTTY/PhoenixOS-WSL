@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Preview usado pelo fzf-tab-completion (estilo gh0stzk/dotfiles)
+p="${1//\\/}"          # remove escapes do bash (ex: "Minha\ Pasta/")
+[[ $p == "~"* ]] && p="$HOME${p:1}"
+
+if [[ -d $p ]]; then
+    eza -1 --icons=always --color=always -a --group-directories-first "$p"
+elif [[ -f $p ]]; then
+    if file --mime-encoding -b "$p" 2>/dev/null | grep -q binary; then
+        file -b "$p"
+    else
+        bat --color=always --style=plain --theme=base16 --line-range=:200 "$p"
+    fi
+fi
