@@ -37,7 +37,7 @@ O build parte da imagem **oficial** do Arch para WSL e usa só este repositório
 
 ```powershell
 wsl --install archlinux --name phoenixos-build --no-launch
-wsl -d phoenixos-build -u root -- bash -c "pacman -Sy --noconfirm git && git clone --depth 1 https://github.com/RobertoBarbosa-AurTTY/PhonixOS-WSL /opt/distro && bash /opt/distro/construir.sh"
+wsl -d phoenixos-build -u root -- bash -c "pacman -Sy --noconfirm git && git clone --depth 1 https://github.com/RobertoBarbosa-AurTTY/PhoenixOS-WSL /opt/distro && bash /opt/distro/construir.sh"
 wsl --terminate phoenixos-build
 wsl --export phoenixos-build phoenixos.wsl
 wsl --unregister phoenixos-build
